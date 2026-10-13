@@ -23,6 +23,11 @@ class BodyPose:
     right_wrist: Point | None = None
 
 
+def temporal_alpha(alpha: float, elapsed_s: float) -> float:
+    """Preserve the nominal 30-FPS EMA response when frame cadence changes."""
+    return 1.0 - (1.0 - alpha) ** (min(.2, max(0., elapsed_s)) * 30.)
+
+
 def _point(landmarks: Sequence, index: int, w: int, h: int) -> Point | None:
     if index >= len(landmarks):
         return None
@@ -59,10 +64,12 @@ def from_mediapipe(landmarks: Sequence, w: int, h: int) -> BodyPose | None:
 class PoseSmoother:
     """Exponential smoothing to reduce jitter without storing video."""
     def __init__(self, alpha: float = 0.42):
+        if not 0. <= alpha <= 1.:
+            raise ValueError('Smoothing alpha must be between 0 and 1')
         self.alpha = alpha
         self.prev: BodyPose | None = None
 
-    def update(self, pose: BodyPose | None) -> BodyPose | None:
+    def update(self, pose: BodyPose | None, elapsed_s: float = 1/30) -> BodyPose | None:
         if pose is None:
             self.prev = None
             return None
@@ -73,7 +80,7 @@ class PoseSmoother:
         def mix(a: Point | None, b: Point | None) -> Point | None:
             if a is None or b is None:
                 return b
-            t = self.alpha
+            t = temporal_alpha(self.alpha, elapsed_s)
             return Point(a.x * (1-t) + b.x*t, a.y*(1-t)+b.y*t, b.confidence)
 
         p = self.prev

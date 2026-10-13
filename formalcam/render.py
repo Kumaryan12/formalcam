@@ -4,11 +4,12 @@ Only NumPy and OpenCV are required here; tests can run without webcam or MediaPi
 """
 from __future__ import annotations
 from dataclasses import dataclass
+import math
 
 import cv2
 import numpy as np
 
-from .pose import BodyPose
+from .pose import BodyPose, temporal_alpha
 
 # BGR colors, intentionally matte and simple (lighting is an approximation).
 PALETTES = {
@@ -24,6 +25,8 @@ class RenderOptions:
     lighting: bool = True
     shadows: bool = True
     restore_forearms: bool = False
+    width_scale: float = 1.0
+    vertical_offset: float = 0.0  # Shoulder-width units, positive moves down.
 
 
 class GarmentRenderer:
@@ -32,7 +35,7 @@ class GarmentRenderer:
         self._direction: float = 0.0
 
     def _estimate_light(self, image: np.ndarray, cx: float, sy: float,
-                        shoulder_width: float) -> tuple[float, float]:
+                        shoulder_width: float, elapsed_s: float = 1/30) -> tuple[float, float]:
         h, w = image.shape[:2]
         # Face-adjacent region above shoulders; imperfect when face isn't centered.
         x0 = int(np.clip(cx - shoulder_width*.29, 0, w-1))
@@ -49,8 +52,9 @@ class GarmentRenderer:
         # Positive direction brightens screen-right (the panel's side=+1).
         directional = 0.0 if lightness.shape[1] < 2 else float(np.clip(
             (lightness[:,split:].mean() - lightness[:,:split].mean()) / 95, -.22, .22))
-        self._brightness = factor if self._brightness is None else .9*self._brightness + .1*factor
-        self._direction = .9*self._direction + .1*directional
+        alpha = temporal_alpha(.1, elapsed_s)
+        self._brightness = factor if self._brightness is None else (1-alpha)*self._brightness + alpha*factor
+        self._direction = (1-alpha)*self._direction + alpha*directional
         return self._brightness, self._direction
 
     @staticmethod
@@ -78,9 +82,10 @@ class GarmentRenderer:
             mask = cv2.GaussianBlur(mask, (5, 5), blur)
         a = (mask.astype(np.float32) * (opacity / 255.))[:, :, None]
         view = image[y0:y1, x0:x1]
-        view[:] = np.clip(view.astype(np.float32)*(1-a) +
-                          np.asarray(color,np.float32)[None,None,:]*a,
-                          0,255).astype(np.uint8)
+        # A convex blend of uint8 colors is already inside [0,255].
+        # Interpolate directly to avoid a full ROI clipping pass per polygon.
+        view[:] = (view.astype(np.float32) +
+                   (np.asarray(color,np.float32)[None,None,:] - view)*a).astype(np.uint8)
 
     @staticmethod
     def _segment_restore_mask(shape: tuple[int,int], pose: BodyPose, width: float) -> np.ndarray:
@@ -99,12 +104,15 @@ class GarmentRenderer:
         return cv2.GaussianBlur(mask, (9,9), 2)
 
     def render(self, frame: np.ndarray, pose: BodyPose | None,
-               opts: RenderOptions | None = None) -> np.ndarray:
+               opts: RenderOptions | None = None, elapsed_s: float = 1/30) -> np.ndarray:
         opts = opts or RenderOptions()
         if pose is None:
+            self._brightness, self._direction = None, 0.0
             return frame.copy()
         if opts.outfit not in PALETTES:
             raise ValueError(f'Unknown outfit: {opts.outfit}')
+        if not .6 <= opts.width_scale <= 1.4 or not -.3 <= opts.vertical_offset <= .3:
+            raise ValueError('Fit width must be 0.6..1.4 and offset -0.3..0.3')
 
         image = frame.copy()
         h,w = image.shape[:2]
@@ -112,7 +120,7 @@ class GarmentRenderer:
         a,b = shoulders
         delta = np.array([b.x-a.x, b.y-a.y], np.float32)
         width = float(np.linalg.norm(delta))
-        if width < 35:
+        if not math.isfinite(width) or width < 35:
             return image
         ux = delta/width
         uy = np.array([-ux[1], ux[0]], np.float32)
@@ -122,11 +130,13 @@ class GarmentRenderer:
         def poly(points: list[tuple[float,float]]) -> np.ndarray:
             return np.array([center + width*(u*ux + v*uy) for u,v in points], dtype=np.int32)
 
-        scale,direction = self._estimate_light(frame, center[0], center[1], width) if opts.lighting else (1.0,0.0)
+        scale,direction = self._estimate_light(frame, center[0], center[1], width, elapsed_s) if opts.lighting else (1.0,0.0)
+        measured_width = width
+        center += measured_width * opts.vertical_offset * uy
+        width *= opts.width_scale
         base = PALETTES[opts.outfit]
         # Keep garment in view. A seated webcam often does not expose hips.
         extent = min(1.55, max(.65, (h-center[1])/max(1,width)))
-        original = frame.copy()
 
         def paint(points, color, opacity=1.0, blur=1.1):
             self._blend_shape(image, poly(points), color, opacity, blur)
@@ -166,6 +176,7 @@ class GarmentRenderer:
         # Composite real arms in front if pose predicts an arm crossing chest.
         # Limitation: this is forearm-shaped occlusion, NOT a skin/hand mask.
         if opts.restore_forearms:
-            m = self._segment_restore_mask((h,w),pose,width).astype(np.float32)[:,:,None]/255
-            image[:] = np.clip(image*(1-m) + original*m,0,255).astype(np.uint8)
+            m = self._segment_restore_mask((h,w),pose,measured_width).astype(np.float32)[:,:,None]/255
+            current = image.astype(np.float32)
+            image[:] = (current + (frame.astype(np.float32)-current)*m).astype(np.uint8)
         return image

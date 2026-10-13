@@ -4,6 +4,14 @@ An **experimental local webcam suit overlay**, intended for testing with OpenAI 
 
 **Important:** This is a 2D geometric rendering that tracks shoulders using MediaPipe Pose Landmarker. It has basic illumination matching, pseudo-lapel shadows, and approximate forearm occlusion. It is **not** photorealistic, does **not** produce physically correct fabric folds or lighting, and must **not** be described as a finished virtual try-on system.
 
+**Local runtime:** MediaPipe is pinned to **0.10.21** because newer distributed
+builds include telemetry with no official opt-out ([upstream discussion](https://github.com/google-ai-edge/mediapipe/issues/6291)).
+Before importing the pose runtime, FormalCam checks this exact version and uses
+macOS's process sandbox to deny all networking. If either check fails, preview
+does not start. This affects only the FormalCam process; it changes no system
+firewall settings or camera permissions. Do not loosen the MediaPipe pin.
+Installation and the explicitly invoked model downloader run separately.
+
 ## 1. Requirements
 
 - Apple Silicon Mac (M5 is fine), macOS camera permission, terminal access
@@ -28,6 +36,14 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python scripts/download_model.py
 ```
+
+`requirements-lock.txt` records the dependency versions validated on Python 3.11
+and macOS arm64. Use `python -m pip install -r requirements-lock.txt` when
+recreating that environment instead of resolving the version ranges afresh.
+The published MediaPipe 0.10.21 universal2 wheel has an x86_64-only internal WHEEL
+tag, so newer `pip check` can report it as unsupported on arm64. Its native binary
+contains arm64 and has been tested on this M5; see `STATUS.md`. Do not resolve
+that metadata warning by upgrading to a telemetry-bearing build.
 
 MediaPipe model is downloaded from Google's official public storage location. It is ignored in Git.
 
@@ -83,9 +99,34 @@ Keyboard controls:
 | A | Approximate forearm occlusion on/off |
 | O | Original webcam vs suit |
 | P | Save original and preview stills locally |
+| I / K | Move suit up / down |
+| [ / ] | Narrow / widen suit |
+| R | Reset width and vertical fit |
 | Q or Escape | Quit |
 
 If the wrong camera opens, try `python -m formalcam.app --camera 1`.
+
+If the collar sits low, begin with `--fit-offset=-0.05` and fine-tune with I/K.
+Offset uses measured shoulder-width units, so -0.05 lifts the garment by 5% of
+shoulder width. Width can be initialized with `--fit-width 0.95`. These adjust the
+2D geometry; they do not estimate neck shape or turn the garment into a 3D model.
+Light estimation still uses the original detected shoulders rather than the shifted garment.
+Pose and light smoothing use elapsed frame time to keep their response consistent
+when FPS varies. Losing pose clears smoothing and light history immediately; the
+original webcam is displayed rather than retaining a stale garment.
+
+To compare throughput with overlapping capture and processing:
+
+```bash
+python -m formalcam.app --latest-frame --fit-offset=-0.05 --max-frames 300 --profile diagnostics/latest-frame.csv
+```
+
+This optional mode keeps only the newest camera frame, dropping older unprocessed
+frames rather than accumulating a queue. Capture owns a background reader; pose,
+rendering and the macOS preview stay on the main thread. The synchronous mode is
+still the default. Compare numeric CSVs under the same lighting and framing;
+snapshot writes temporarily pause processing. Neither FPS nor stage timings measure
+the complete sensor-to-screen latency. Low-confidence/missing pose still shows the original.
 
 ## 5. Virtual camera output (optional, after preview works)
 
@@ -110,6 +151,8 @@ formalcam/
   __init__.py
   app.py           # webcam loop, MediaPipe pose, display, virtual sender
   diagnostics.py   # local numeric performance logs and opt-in stills
+  capture.py       # optional background capture with only the latest frame
+  privacy.py       # version check and macOS process network restriction
   pose.py          # coordinate extraction and EMA smoothing
   render.py        # stylized blazer geometry, basic light matching
 scripts/

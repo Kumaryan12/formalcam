@@ -55,3 +55,46 @@ def test_brighter_screen_left_lights_left_jacket_panel():
     left_gain = lit[400, 370].mean() / flat[400, 370].mean()
     right_gain = lit[400, 590].mean() / flat[400, 590].mean()
     assert left_gain > right_gain
+
+
+def test_fit_can_lift_collar_and_narrow_garment_without_mutating_source():
+    image = np.full((720, 1280, 3), 125, np.uint8)
+    pose = synthetic_pose(1280, 720)
+    default = GarmentRenderer().render(image, pose, RenderOptions(lighting=False))
+    fitted = GarmentRenderer().render(image, pose, RenderOptions(lighting=False, width_scale=.85, vertical_offset=-.05))
+    default_mask = np.any(default != image, axis=2)
+    fitted_mask = np.any(fitted != image, axis=2)
+    assert np.where(fitted_mask)[0].min() < np.where(default_mask)[0].min()
+    assert fitted_mask[550].sum() < default_mask[550].sum()
+    assert np.all(image == 125)
+
+
+def test_restoring_forearm_outside_garment_preserves_original_pixels():
+    from formalcam.pose import BodyPose, Point
+    image = np.full((540, 960, 3), 125, np.uint8)
+    pose = BodyPose(Point(336, 205), Point(624, 205), Point(30, 100), None, Point(100, 110))
+    out = GarmentRenderer().render(image, pose, RenderOptions(restore_forearms=True))
+    assert np.array_equal(out[:140], image[:140])
+
+
+def test_lighting_reacquisition_uses_current_room_after_pose_loss():
+    renderer = GarmentRenderer()
+    pose = synthetic_pose(960, 540)
+    dim = np.full((540, 960, 3), 45, np.uint8)
+    bright = np.full((540, 960, 3), 220, np.uint8)
+    renderer.render(dim, pose)
+    renderer.render(bright, None)
+    reacquired = renderer.render(bright, pose)
+    fresh = GarmentRenderer().render(bright, pose)
+    assert np.array_equal(reacquired, fresh)
+
+
+def test_light_smoothing_response_is_consistent_at_15_and_30_fps():
+    dim = np.full((540, 960, 3), 45, np.uint8)
+    bright = np.full((540, 960, 3), 220, np.uint8)
+    fast, slow = GarmentRenderer(), GarmentRenderer()
+    fast._estimate_light(dim, 480, 205, 288)
+    slow._estimate_light(dim, 480, 205, 288)
+    for _ in range(6): fast_result = fast._estimate_light(bright, 480, 205, 288, 1/30)
+    for _ in range(3): slow_result = slow._estimate_light(bright, 480, 205, 288, 1/15)
+    assert np.allclose(fast_result, slow_result)

@@ -13,6 +13,8 @@ import cv2
 import numpy as np
 
 from .diagnostics import FrameStats, save_snapshot
+from .capture import LatestFrameCapture
+from .privacy import prepare_pose_runtime
 from .pose import BodyPose, Point, PoseSmoother, from_mediapipe
 from .render import GarmentRenderer, RenderOptions
 
@@ -28,6 +30,7 @@ def synthetic_pose(w: int, h: int) -> BodyPose:
 def create_landmarker(model_path: Path):
     if not model_path.is_file():
         raise FileNotFoundError(f'Missing pose model at {model_path}; run python scripts/download_model.py first.')
+    prepare_pose_runtime()
     import mediapipe as mp
     options = mp.tasks.vision.PoseLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
@@ -40,14 +43,14 @@ def create_landmarker(model_path: Path):
     return mp.tasks.vision.PoseLandmarker.create_from_options(options)
 
 
-def badge(image: np.ndarray, lines: list[str]):
+def badge(image: np.ndarray, lines: list[str]) -> None:
     for i,line in enumerate(lines):
         y=24 + 23*i
         cv2.putText(image,line,(16,y),cv2.FONT_HERSHEY_SIMPLEX,.55,(0,0,0),3,cv2.LINE_AA)
         cv2.putText(image,line,(16,y),cv2.FONT_HERSHEY_SIMPLEX,.55,(247,247,247),1,cv2.LINE_AA)
 
 
-def demo(out: Path):
+def demo(out: Path) -> None:
     h,w=540,960
     # Neutral placeholder, deliberately not a real person. This exercises rendering only.
     x=np.linspace(0,1,w,dtype=np.float32)
@@ -64,15 +67,24 @@ def demo(out: Path):
     print('Saved',out)
 
 
-def run(args: argparse.Namespace) -> None:
-    import mediapipe as mp
+def adjust_fit(opts: RenderOptions, key: int) -> None:
+    if key == ord('['): opts.width_scale = max(.6, opts.width_scale - .02)
+    if key == ord(']'): opts.width_scale = min(1.4, opts.width_scale + .02)
+    if key in (ord('i'), ord('I')): opts.vertical_offset = max(-.3, opts.vertical_offset - .01)
+    if key in (ord('k'), ord('K')): opts.vertical_offset = min(.3, opts.vertical_offset + .01)
+    if key in (ord('r'), ord('R')):
+        opts.width_scale, opts.vertical_offset = 1., 0.
 
+
+def run(args: argparse.Namespace) -> None:
     # Initialize the local model before acquiring camera or virtual-camera resources.
     with contextlib.ExitStack() as stack:
         landmarker = stack.enter_context(create_landmarker(MODEL))
+        import mediapipe as mp
         cap = cv2.VideoCapture(args.camera, cv2.CAP_AVFOUNDATION if sys.platform == 'darwin' else cv2.CAP_ANY)
+        reader: LatestFrameCapture | None = None
         stack.callback(cv2.destroyAllWindows)
-        stack.callback(cap.release)
+        stack.callback(lambda: reader.close() if reader is not None else cap.release())
         if not cap.isOpened():
             raise RuntimeError('Could not open webcam. Close FaceTime/Zoom and allow camera access for the app hosting Python in macOS Settings > Privacy & Security > Camera.')
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
@@ -97,15 +109,24 @@ def run(args: argparse.Namespace) -> None:
             args.profile.parent.mkdir(parents=True, exist_ok=True)
             stream = stack.enter_context(args.profile.open('w', newline=''))
         stats = FrameStats(time.monotonic(), stream)
-        opts, renderer, smoother = RenderOptions(), GarmentRenderer(), PoseSmoother()
+        if args.latest_frame:
+            reader = LatestFrameCapture(cap)
+        opts = RenderOptions(width_scale=args.fit_width, vertical_offset=args.fit_offset)
+        renderer, smoother = GarmentRenderer(), PoseSmoother()
         overlay_on = True
+        previous_frame_time = stats.start
         last_timestamp = -1
         window = 'FormalCam - Local Preview'
-        print('Controls: 1/2/3 outfit, L lighting, S shadows, A arm restore, O original, P local snapshot, Q quit', flush=True)
+        print('Controls: 1/2/3 outfit, L lighting, S shadows, A arms, O original, P snapshot, [/] width, I/K up/down, R reset fit, Q quit', flush=True)
         try:
             while True:
                 begin = time.monotonic()
-                ok, raw = cap.read()
+                if reader is None:
+                    ok, raw = cap.read()
+                    frame_time = time.monotonic()
+                else:
+                    raw, frame_time = reader.read()
+                    ok = True
                 captured = time.monotonic()
                 if not ok or raw is None:
                     raise RuntimeError('Camera stopped supplying frames.')
@@ -114,13 +135,15 @@ def run(args: argparse.Namespace) -> None:
                 img = cv2.flip(raw, 1) if not args.no_mirror else raw
                 rgb = np.ascontiguousarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                timestamp = max(last_timestamp + 1, int((captured - stats.start) * 1000))
+                timestamp = max(last_timestamp + 1, int((frame_time - stats.start) * 1000))
                 last_timestamp = timestamp
                 result = landmarker.detect_for_video(mp_image, timestamp)
                 pose = from_mediapipe(result.pose_landmarks[0], w, h) if result.pose_landmarks else None
-                pose = smoother.update(pose)
+                elapsed_s = max(0., frame_time - previous_frame_time)
+                previous_frame_time = frame_time
+                pose = smoother.update(pose, elapsed_s)
                 posed = time.monotonic()
-                processed = renderer.render(img, pose, opts) if overlay_on else img.copy()
+                processed = renderer.render(img, pose, opts, elapsed_s) if overlay_on else img.copy()
                 rendered = time.monotonic()
                 if sender is not None:
                     sender.send(cv2.cvtColor(processed, cv2.COLOR_BGR2RGB))
@@ -128,6 +151,7 @@ def run(args: argparse.Namespace) -> None:
                 preview = processed.copy()
                 badge(preview, [f'FormalCam 0.1 | {opts.outfit} | pose: {"yes" if pose else "no"} | {stats.fps:.1f} fps',
                                 '1/2/3 outfit  L light  S shadow  A arm  O original  P save  Q quit',
+                                f'[/] width {opts.width_scale:.2f}  I/K up/down {opts.vertical_offset:+.2f}  R reset fit',
                                 '2D geometric demo - not a photorealistic garment'])
                 cv2.imshow(window, preview)
                 key = cv2.waitKey(1) & 0xFF
@@ -152,11 +176,14 @@ def run(args: argparse.Namespace) -> None:
                 if key in (ord('s'), ord('S')): opts.shadows = not opts.shadows
                 if key in (ord('a'), ord('A')): opts.restore_forearms = not opts.restore_forearms
                 if key in (ord('o'), ord('O')): overlay_on = not overlay_on
+                adjust_fit(opts, key)
         finally:
             print('Session:', stats.summary(), flush=True)
+            if reader is not None:
+                print(f'Camera reads: {reader.received}, delivered: {reader.delivered}, skipped: {reader.skipped}', flush=True)
 
 
-def main():
+def main() -> None:
     ap=argparse.ArgumentParser(description='FormalCam: experimental local webcam suit overlay')
     ap.add_argument('--camera',type=int,default=0,help='camera index')
     ap.add_argument('--width',type=int,default=1280)
@@ -169,9 +196,14 @@ def main():
     ap.add_argument('--max-frames', type=int, default=0, help='Stop after N frames; 0 runs until Q')
     ap.add_argument('--snapshot-dir', type=Path, default=Path('diagnostics'), help='Local P-key snapshots')
     ap.add_argument('--snapshot-frame', type=int, default=0, help='Save a local still at frame N; 0 disables')
+    ap.add_argument('--fit-width', type=float, default=1., help='Garment width multiplier, 0.6..1.4')
+    ap.add_argument('--fit-offset', type=float, default=0., help='Vertical shift in shoulder-width units, -0.3..0.3; negative moves up')
+    ap.add_argument('--latest-frame', action='store_true', help='Overlap capture with processing and keep only the newest frame')
     args=ap.parse_args()
     if args.width <= 0 or args.height <= 0 or args.max_frames < 0 or args.snapshot_frame < 0:
         ap.error('Dimensions must be positive and frame counts nonnegative')
+    if not .6 <= args.fit_width <= 1.4 or not -.3 <= args.fit_offset <= .3:
+        ap.error('Fit width must be 0.6..1.4 and offset -0.3..0.3')
     try:
         if args.demo_frame: demo(args.demo_output)
         else: run(args)

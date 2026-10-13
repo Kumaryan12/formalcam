@@ -36,3 +36,14 @@ def test_low_confidence_shoulder_rejects_pose():
     points = landmarks()
     points[11].presence = .2
     assert from_mediapipe(points, 1280, 720) is None
+
+
+def test_smoothing_response_is_consistent_at_15_and_30_fps():
+    initial = BodyPose(Point(100, 100), Point(300, 100))
+    target = BodyPose(Point(200, 100), Point(400, 100))
+    fast, slow = PoseSmoother(), PoseSmoother()
+    fast.update(initial)
+    slow.update(initial)
+    for _ in range(6): fast_result = fast.update(target, 1/30)
+    for _ in range(3): slow_result = slow.update(target, 1/15)
+    assert fast_result.left_shoulder.x == pytest.approx(slow_result.left_shoulder.x)
