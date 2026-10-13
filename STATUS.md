@@ -52,6 +52,10 @@ The final run verified camera/display and reader shutdown, but its FPS is **fall
 performance**, not suit-rendering performance. The final restricted detector also
 recognized pose in an earlier local webcam still. With a person continuously in
 view, final live fit, motion/lighting stability, and full suit throughput need review.
+The subsequently reopened restricted preview also reacquired **valid live pose**:
+132 of its first 300 frames had pose after an initial absence. Its 29.8 whole-loop
+FPS includes both missing-pose and detected-pose frames, so it is still not a
+controlled sustained-suit comparison. The preview is left open for local fit tuning.
 Changing capture waits and snapshot writes prevent a controlled FPS comparison.
 A synthetic 720p rendering microbenchmark improved median time from 7.03 to 6.62 ms
 before the dependency rollback; no overall preview FPS gain is claimed. These are
