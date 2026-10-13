@@ -17,6 +17,8 @@ was installed and no macOS permissions were changed by the agent.
   restoration changing pixels outside the garment.
 - **I/K** move the suit up/down, **[/]** change width, **R** resets. User reported
   the collar sitting too low; `--fit-offset=-0.05` starts it 5% of shoulder width higher.
+  The user subsequently confirmed that the upward shift improved alignment and
+  that they were out of view during the initial missing-pose/latest-frame run.
 - Pose and lighting smoothing use elapsed time, tested for equivalent response at
   15 and 30 FPS. Optional `--latest-frame` overlaps camera capture and processing
   and keeps only the newest frame; synchronous capture remains the default.
@@ -54,8 +56,18 @@ recognized pose in an earlier local webcam still. With a person continuously in
 view, final live fit, motion/lighting stability, and full suit throughput need review.
 The subsequently reopened restricted preview also reacquired **valid live pose**:
 132 of its first 300 frames had pose after an initial absence. Its 29.8 whole-loop
-FPS includes both missing-pose and detected-pose frames, so it is still not a
-controlled sustained-suit comparison. The preview is left open for local fit tuning.
+FPS includes both missing-pose and detected-pose frames, so that initial segment
+is not a controlled sustained-suit comparison.
+
+The later saved interactive session completed **152,273 frames over 84.6 minutes**
+and shut down normally. Its final uninterrupted suit-rendering stretch contained
+496 frames. Excluding the first 30 for warm-up and the final window-close frame
+leaves **465 continuously detected/rendered frames at 29.92 FPS**. Mean stages:
+capture 2.93 ms, pose 8.51 ms, render 7.72 ms, display 14.20 ms. This verifies near
+30-FPS 720p suit rendering for that stretch with `--latest-frame`; it does not
+prove a controlled improvement over the earlier sessions or sensor-to-screen latency.
+A fresh 600-frame follow-up again had no accepted pose and is fallback-only data.
+If the badge says `pose: no`, move back until both shoulders and upper chest are visible.
 Changing capture waits and snapshot writes prevent a controlled FPS comparison.
 A synthetic 720p rendering microbenchmark improved median time from 7.03 to 6.62 ms
 before the dependency rollback; no overall preview FPS gain is claimed. These are
