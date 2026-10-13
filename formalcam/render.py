@@ -4,12 +4,12 @@ Only NumPy and OpenCV are required here; tests can run without webcam or MediaPi
 """
 from __future__ import annotations
 from dataclasses import dataclass
-import math
 
 import cv2
 import numpy as np
 
 from .pose import BodyPose, temporal_alpha
+from .geometry import TorsoFitter
 
 # BGR colors, intentionally matte and simple (lighting is an approximation).
 PALETTES = {
@@ -33,6 +33,11 @@ class GarmentRenderer:
     def __init__(self):
         self._brightness: float | None = None
         self._direction: float = 0.0
+        self._fitter = TorsoFitter()
+
+    def reset(self) -> None:
+        self._brightness, self._direction = None, 0.0
+        self._fitter.reset()
 
     def _estimate_light(self, image: np.ndarray, cx: float, sy: float,
                         shoulder_width: float, elapsed_s: float = 1/30) -> tuple[float, float]:
@@ -107,7 +112,7 @@ class GarmentRenderer:
                opts: RenderOptions | None = None, elapsed_s: float = 1/30) -> np.ndarray:
         opts = opts or RenderOptions()
         if pose is None:
-            self._brightness, self._direction = None, 0.0
+            self.reset()
             return frame.copy()
         if opts.outfit not in PALETTES:
             raise ValueError(f'Unknown outfit: {opts.outfit}')
@@ -116,24 +121,18 @@ class GarmentRenderer:
 
         image = frame.copy()
         h,w = image.shape[:2]
-        shoulders = sorted((pose.left_shoulder, pose.right_shoulder), key=lambda p: p.x)
-        a,b = shoulders
-        delta = np.array([b.x-a.x, b.y-a.y], np.float32)
-        width = float(np.linalg.norm(delta))
-        if not math.isfinite(width) or width < 35:
+        geometry = self._fitter.fit(pose, (h,w), opts.width_scale, opts.vertical_offset, elapsed_s)
+        if geometry is None:
             return image
-        ux = delta/width
-        uy = np.array([-ux[1], ux[0]], np.float32)
-        if uy[1] < 0: uy = -uy
-        center = (np.array([a.x,a.y]) + np.array([b.x,b.y]))*.5
+        measured_width = geometry.shoulder_width
+        center = geometry.center
+        width = measured_width * opts.width_scale
 
         def poly(points: list[tuple[float,float]]) -> np.ndarray:
-            return np.array([center + width*(u*ux + v*uy) for u,v in points], dtype=np.int32)
+            return geometry.points(points)
 
-        scale,direction = self._estimate_light(frame, center[0], center[1], width, elapsed_s) if opts.lighting else (1.0,0.0)
-        measured_width = width
-        center += measured_width * opts.vertical_offset * uy
-        width *= opts.width_scale
+        light_center = center - measured_width * opts.vertical_offset * geometry.down
+        scale,direction = self._estimate_light(frame, light_center[0], light_center[1], measured_width, elapsed_s) if opts.lighting else (1.0,0.0)
         base = PALETTES[opts.outfit]
         # Keep garment in view. A seated webcam often does not expose hips.
         extent = min(1.55, max(.65, (h-center[1])/max(1,width)))

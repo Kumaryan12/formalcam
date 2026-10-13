@@ -85,8 +85,26 @@ def test_missing_pose_sends_clean_original_and_video_timestamps_increase(monkeyp
     monkeypatch.setattr(app.time, 'monotonic', lambda: 100.)
     args = Namespace(camera=0, width=30, height=20, virtual_camera=True,
                      profile=None, no_mirror=False, fit_width=1., fit_offset=0., latest_frame=False,
-                     max_frames=3, snapshot_frame=0, snapshot_dir=tmp_path)
+                     max_frames=3, snapshot_frame=0, snapshot_dir=tmp_path, segmentation=False,
+                     segmentation_model=tmp_path/'missing.tflite', segmentation_interval=.1, segmentation_max_age=.25)
     app.run(args)
     assert timestamps == [0, 1, 2]
     assert len(sent) == 3 and all(np.array_equal(frame, raw) for frame in sent)
     assert closed == ['sender', 'camera', 'pose']
+
+
+def test_fps_separates_capture_from_actual_virtual_output():
+    stats = FrameStats(10.)
+    stats.update(10.1, True, {}, capture_frames=3, output_sent=False)
+    assert stats.capture_fps == pytest.approx(30.)
+    assert stats.output_fps == 0.
+    stats.update(10.2, True, {}, capture_frames=6, output_sent=True, seg_inference_ms=20., seg_fresh=True)
+    assert stats.output_fps == pytest.approx(5.)
+    assert stats.segmentation_results == 1
+
+
+def test_automatic_snapshot_option_is_rejected(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['formalcam', '--snapshot-frame', '1'])
+    with pytest.raises(SystemExit) as caught:
+        app.main()
+    assert caught.value.code == 2

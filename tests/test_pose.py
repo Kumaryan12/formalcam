@@ -47,3 +47,15 @@ def test_smoothing_response_is_consistent_at_15_and_30_fps():
     for _ in range(6): fast_result = fast.update(target, 1/30)
     for _ in range(3): slow_result = slow.update(target, 1/15)
     assert fast_result.left_shoulder.x == pytest.approx(slow_result.left_shoulder.x)
+
+
+def test_hip_coordinates_are_scaled_and_low_confidence_hip_does_not_drop_shoulders():
+    points = landmarks()
+    points[23].x, points[23].y = .37, .8
+    points[24].x, points[24].y = .63, .8
+    pose = from_mediapipe(points, 1280, 720)
+    assert pose.left_hip.x == pytest.approx(.37*1280)
+    assert pose.right_hip.y == pytest.approx(.8*720)
+    points[23].visibility = .2
+    pose = from_mediapipe(points, 1280, 720)
+    assert pose is not None and pose.left_hip is None and pose.right_hip is not None

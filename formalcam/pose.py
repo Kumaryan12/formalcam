@@ -21,6 +21,9 @@ class BodyPose:
     right_elbow: Point | None = None
     left_wrist: Point | None = None
     right_wrist: Point | None = None
+    left_hip: Point | None = None
+    right_hip: Point | None = None
+    nose: Point | None = None
 
 
 def temporal_alpha(alpha: float, elapsed_s: float) -> float:
@@ -58,7 +61,10 @@ def from_mediapipe(landmarks: Sequence, w: int, h: int) -> BodyPose | None:
                     _point(landmarks, 13, w, h),
                     _point(landmarks, 14, w, h),
                     _point(landmarks, 15, w, h),
-                    _point(landmarks, 16, w, h))
+                    _point(landmarks, 16, w, h),
+                    _point(landmarks, 23, w, h),
+                    _point(landmarks, 24, w, h),
+                    _point(landmarks, 0, w, h))
 
 
 class PoseSmoother:
@@ -80,7 +86,8 @@ class PoseSmoother:
         def mix(a: Point | None, b: Point | None) -> Point | None:
             if a is None or b is None:
                 return b
-            t = temporal_alpha(self.alpha, elapsed_s)
+            # Trust weaker but still valid observations less, without holding a lost pose.
+            t = temporal_alpha(self.alpha * min(1., max(.5, b.confidence)), elapsed_s)
             return Point(a.x * (1-t) + b.x*t, a.y*(1-t)+b.y*t, b.confidence)
 
         p = self.prev
@@ -91,5 +98,8 @@ class PoseSmoother:
             mix(p.right_elbow, pose.right_elbow),
             mix(p.left_wrist, pose.left_wrist),
             mix(p.right_wrist, pose.right_wrist),
+            mix(p.left_hip, pose.left_hip),
+            mix(p.right_hip, pose.right_hip),
+            mix(p.nose, pose.nose),
         )
         return self.prev

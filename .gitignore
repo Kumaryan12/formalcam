@@ -2,6 +2,7 @@
 __pycache__/
 .pytest_cache/
 models/*.task
+models/*.tflite
 demo_preview.png
 .DS_Store
 diagnostics/

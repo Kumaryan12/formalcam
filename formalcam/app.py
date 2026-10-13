@@ -15,8 +15,11 @@ import numpy as np
 from .diagnostics import FrameStats, save_snapshot
 from .capture import LatestFrameCapture
 from .privacy import prepare_pose_runtime
-from .pose import BodyPose, Point, PoseSmoother, from_mediapipe
+from .pose import BodyPose, Point
 from .render import GarmentRenderer, RenderOptions
+from .pipeline import FrameProcessor
+from .segmentation import SegmentationEngine, MODEL as SEGMENTATION_MODEL
+from .debug import debug_preview
 
 MODEL = Path(__file__).resolve().parent.parent / 'models' / 'pose_landmarker_lite.task'
 
@@ -80,7 +83,6 @@ def run(args: argparse.Namespace) -> None:
     # Initialize the local model before acquiring camera or virtual-camera resources.
     with contextlib.ExitStack() as stack:
         landmarker = stack.enter_context(create_landmarker(MODEL))
-        import mediapipe as mp
         cap = cv2.VideoCapture(args.camera, cv2.CAP_AVFOUNDATION if sys.platform == 'darwin' else cv2.CAP_ANY)
         reader: LatestFrameCapture | None = None
         stack.callback(cv2.destroyAllWindows)
@@ -112,12 +114,18 @@ def run(args: argparse.Namespace) -> None:
         if args.latest_frame:
             reader = LatestFrameCapture(cap)
         opts = RenderOptions(width_scale=args.fit_width, vertical_offset=args.fit_offset)
-        renderer, smoother = GarmentRenderer(), PoseSmoother()
+        segmentation = SegmentationEngine(args.segmentation_model, args.segmentation_interval, args.segmentation_max_age)
+        stack.callback(segmentation.close)
+        processor = FrameProcessor(landmarker, segmentation)
+        segmentation_on = args.segmentation
+        landmarks_on = mask_on = False
+        last_seg_error = None
+        last_seg_latency = 0.
         overlay_on = True
         previous_frame_time = stats.start
         last_timestamp = -1
         window = 'FormalCam - Local Preview'
-        print('Controls: 1/2/3 outfit, L lighting, S shadows, A arms, O original, P snapshot, [/] width, I/K up/down, R reset fit, Q quit', flush=True)
+        print('Controls: 1/2/3 outfit, L lighting, S shadows, A arms, O original, P snapshot, G segmentation, D landmarks, M mask, [/] width, I/K up/down, R reset fit, Q quit', flush=True)
         try:
             while True:
                 begin = time.monotonic()
@@ -133,34 +141,38 @@ def run(args: argparse.Namespace) -> None:
                 if raw.shape[:2] != (h, w):
                     raise RuntimeError('Camera frame dimensions changed; restart the preview.')
                 img = cv2.flip(raw, 1) if not args.no_mirror else raw
-                rgb = np.ascontiguousarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 timestamp = max(last_timestamp + 1, int((frame_time - stats.start) * 1000))
                 last_timestamp = timestamp
-                result = landmarker.detect_for_video(mp_image, timestamp)
-                pose = from_mediapipe(result.pose_landmarks[0], w, h) if result.pose_landmarks else None
                 elapsed_s = max(0., frame_time - previous_frame_time)
                 previous_frame_time = frame_time
-                pose = smoother.update(pose, elapsed_s)
-                posed = time.monotonic()
-                processed = renderer.render(img, pose, opts, elapsed_s) if overlay_on else img.copy()
+                frame = processor.process(img, timestamp, frame_time, elapsed_s, opts, overlay_on, segmentation_on)
+                processed, pose = frame.image, frame.pose
                 rendered = time.monotonic()
+                if frame.mask.inference_ms:
+                    last_seg_latency = frame.mask.inference_ms
+                if frame.segmentation_error and frame.segmentation_error != last_seg_error:
+                    print(frame.segmentation_error, flush=True)
+                    last_seg_error = frame.segmentation_error
                 if sender is not None:
                     sender.send(cv2.cvtColor(processed, cv2.COLOR_BGR2RGB))
                 sent = time.monotonic()
-                preview = processed.copy()
-                badge(preview, [f'FormalCam 0.1 | {opts.outfit} | pose: {"yes" if pose else "no"} | {stats.fps:.1f} fps',
+                preview = debug_preview(processed, pose, frame.mask.allowance, landmarks_on, mask_on)
+                seg_label = 'off' if not segmentation_on else ('unavailable' if frame.segmentation_error else ('ready' if frame.mask.allowance is not None else 'waiting'))
+                badge(preview, [f'FormalCam | {opts.outfit} | pose: {"yes" if pose else "no"} | {stats.fps:.1f} fps | pose {frame.timings["pose"]*1000:.1f}ms',
                                 '1/2/3 outfit  L light  S shadow  A arm  O original  P save  Q quit',
                                 f'[/] width {opts.width_scale:.2f}  I/K up/down {opts.vertical_offset:+.2f}  R reset fit',
+                                f'G segmentation {seg_label}  {last_seg_latency:.1f}ms inference  D landmarks  M mask',
                                 '2D geometric demo - not a photorealistic garment'])
                 cv2.imshow(window, preview)
                 key = cv2.waitKey(1) & 0xFF
                 displayed = time.monotonic()
                 stats.update(displayed, pose is not None,
-                             dict(capture=captured-begin, pose=posed-captured,
-                                  render=rendered-posed, send=sent-rendered,
-                                  display=displayed-sent))
-                if key in (ord('p'), ord('P')) or stats.frames == args.snapshot_frame:
+                             dict(frame.timings, capture=captured-begin, send=sent-rendered,
+                                  display=displayed-sent), output_sent=sender is not None,
+                             capture_frames=reader.received if reader is not None else stats.frames+1,
+                             seg_inference_ms=frame.mask.inference_ms, seg_fresh=frame.mask.fresh,
+                             seg_age_ms=frame.mask.age_ms)
+                if key in (ord('p'), ord('P')):
                     save_snapshot(args.snapshot_dir, stats.frames, img, preview)
                 if stats.frames % 60 == 0:
                     print(stats.summary(), flush=True)
@@ -176,6 +188,9 @@ def run(args: argparse.Namespace) -> None:
                 if key in (ord('s'), ord('S')): opts.shadows = not opts.shadows
                 if key in (ord('a'), ord('A')): opts.restore_forearms = not opts.restore_forearms
                 if key in (ord('o'), ord('O')): overlay_on = not overlay_on
+                if key in (ord('g'), ord('G')): segmentation_on = not segmentation_on
+                if key in (ord('d'), ord('D')): landmarks_on = not landmarks_on
+                if key in (ord('m'), ord('M')): mask_on = not mask_on
                 adjust_fit(opts, key)
         finally:
             print('Session:', stats.summary(), flush=True)
@@ -195,11 +210,19 @@ def main() -> None:
     ap.add_argument('--profile', type=Path, help='Local numeric timing CSV; contains no images')
     ap.add_argument('--max-frames', type=int, default=0, help='Stop after N frames; 0 runs until Q')
     ap.add_argument('--snapshot-dir', type=Path, default=Path('diagnostics'), help='Local P-key snapshots')
-    ap.add_argument('--snapshot-frame', type=int, default=0, help='Save a local still at frame N; 0 disables')
+    ap.add_argument('--snapshot-frame', type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument('--fit-width', type=float, default=1., help='Garment width multiplier, 0.6..1.4')
     ap.add_argument('--fit-offset', type=float, default=0., help='Vertical shift in shoulder-width units, -0.3..0.3; negative moves up')
     ap.add_argument('--latest-frame', action='store_true', help='Overlap capture with processing and keep only the newest frame')
+    ap.add_argument('--segmentation', action='store_true', help='Optional multiclass clothing mask; missing/stale mask shows original')
+    ap.add_argument('--segmentation-model', type=Path, default=SEGMENTATION_MODEL)
+    ap.add_argument('--segmentation-interval', type=float, default=.1, help='Seconds between segmentation jobs, 0.04..1')
+    ap.add_argument('--segmentation-max-age', type=float, default=.25, help='Discard masks older than this many seconds, 0.1..0.5')
     args=ap.parse_args()
+    if args.snapshot_frame:
+        ap.error('Automatic webcam snapshots are disabled; press P for a local still')
+    if not .04 <= args.segmentation_interval <= 1. or not .1 <= args.segmentation_max_age <= .5:
+        ap.error('Segmentation interval must be 0.04..1 and mask age 0.1..0.5')
     if args.width <= 0 or args.height <= 0 or args.max_frames < 0 or args.snapshot_frame < 0:
         ap.error('Dimensions must be positive and frame counts nonnegative')
     if not .6 <= args.fit_width <= 1.4 or not -.3 <= args.fit_offset <= .3:
